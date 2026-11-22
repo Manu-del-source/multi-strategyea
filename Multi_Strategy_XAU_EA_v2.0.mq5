@@ -10,7 +10,7 @@
 //|  NO martingale, NO grid, NO averaging down.                     |
 //+------------------------------------------------------------------+
 #property copyright "Starter template"
-#property version   "2.00"
+#property version   "2.10"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -131,7 +131,20 @@ int OnInit()
       hBB == INVALID_HANDLE || hRSI == INVALID_HANDLE || hATRH1 == INVALID_HANDLE)
       return INIT_FAILED;
 
+   if(InpSlopeBars < 1 || InpVolLookback < 2 || InpMaxDailyLossPct <= 0.0 ||
+      InpMaxTotalRiskPct <= 0.0 || InpMaxOpenPositions < 1 ||
+      InpAsianStartHour < 0 || InpAsianStartHour > 23 ||
+      InpAsianEndHour < 1 || InpAsianEndHour > 24 ||
+      InpAsianStartHour >= InpAsianEndHour ||
+      InpBreakEndHour < 1 || InpBreakEndHour > 24 ||
+      InpAsianEndHour >= InpBreakEndHour)
+   {
+      Print("Invalid EA inputs. Check risk, lookback and session-hour settings.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
    ArrayInitialize(tradesToday, 0);
+   trade.SetAsyncMode(false);
    trade.SetDeviationInPoints(InpSlippagePoints);
    trade.SetTypeFillingBySymbol(_Symbol);
    return INIT_SUCCEEDED;
@@ -287,35 +300,43 @@ double CalcLots(double slDistance, double riskPct)
    double step   = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
    double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
    double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   if(step <= 0.0 || minLot <= 0.0 || maxLot < minLot) return 0.0;
 
-   lots = MathFloor(lots / step) * step;
+   lots = MathFloor(lots / step + 1e-8) * step;
+   lots = NormalizeDouble(lots, 8);
    if(lots < minLot) return 0.0;   // too small for this risk % -> skip, never oversize
-   return MathMin(lots, maxLot);
+   lots = MathMin(lots, maxLot);
+   return NormalizeDouble(lots, 8);
 }
 
 //+------------------------------------------------------------------+
 //| Regime: +1 Bull, -1 Bear, 0 Neutral                              |
 //+------------------------------------------------------------------+
-int GetRegime()
+bool GetRegime(int &regime)
 {
+   regime = 0;
    int need = InpSlopeBars + 2;
    double ema[], ratr[], radx[];
    ArraySetAsSeries(ema,  true);
    ArraySetAsSeries(ratr, true);
    ArraySetAsSeries(radx, true);
-   if(CopyBuffer(hREMA, 0, 0, need, ema)  < need) return 0;
-   if(CopyBuffer(hRATR, 0, 0, 3,    ratr) < 3)    return 0;
-   if(CopyBuffer(hRADX, 0, 0, 3,    radx) < 3)    return 0;
+   if(CopyBuffer(hREMA, 0, 0, need, ema)  < need) return false;
+   if(CopyBuffer(hRATR, 0, 0, 3,    ratr) < 3)    return false;
+   if(CopyBuffer(hRADX, 0, 0, 3,    radx) < 3)    return false;
 
-   if(ratr[1] <= 0.0) return 0;
-   if(radx[1] < InpRegimeMinADX) return 0;
+   if(ratr[1] <= 0.0 || !MathIsValidNumber(ratr[1]) || !MathIsValidNumber(radx[1])) return false;
+   if(iClose(_Symbol, InpRegimeTF, 1) <= 0.0) return false;
 
    double slope = (ema[1] - ema[1 + InpSlopeBars]) / ratr[1];
    double close = iClose(_Symbol, InpRegimeTF, 1);
 
-   if(slope >=  InpSlopeThresh && close > ema[1]) return  1;
-   if(slope <= -InpSlopeThresh && close < ema[1]) return -1;
-   return 0;
+   if(!MathIsValidNumber(slope) || !MathIsValidNumber(close)) return false;
+   if(radx[1] < InpRegimeMinADX) { regime = 0; return true; }
+
+   if(slope >=  InpSlopeThresh && close > ema[1]) regime =  1;
+   else if(slope <= -InpSlopeThresh && close < ema[1]) regime = -1;
+   else regime = 0;
+   return true;
 }
 
 bool VolatilitySpike()
@@ -366,9 +387,14 @@ bool Place(int id, bool isBuy, double slDist, double tpDist, double riskPct)
       else
          ok = trade.Sell(lots, _Symbol, bid, NormalizeDouble(bid + slDist, digits),
                          NormalizeDouble(bid - tpDist, digits), "v2 " + tag + " SELL");
-      if(ok) { tradesToday[id]++; return true; }
-
       uint rc = trade.ResultRetcode();
+      if(ok && (rc == TRADE_RETCODE_DONE || rc == TRADE_RETCODE_PLACED ||
+                rc == TRADE_RETCODE_DONE_PARTIAL))
+      {
+         tradesToday[id]++;
+         Print("Order accepted (", tag, "), retcode=", rc, ", volume=", lots);
+         return true;
+      }
       if(rc != TRADE_RETCODE_REQUOTE && rc != TRADE_RETCODE_PRICE_CHANGED &&
          rc != TRADE_RETCODE_PRICE_OFF)
          break;
@@ -455,7 +481,12 @@ void TryRange(int regime)
 bool UpdateAsianRange()
 {
    datetime now = TimeCurrent();
-   datetime dayStart = (datetime)((long)now - ((long)now % 86400));
+   MqlDateTime serverDate;
+   TimeToStruct(now, serverDate);
+   serverDate.hour = 0;
+   serverDate.min  = 0;
+   serverDate.sec  = 0;
+   datetime dayStart = StructToTime(serverDate);
    if(asianDayStart == dayStart) return asianValid;
 
    datetime s = dayStart + InpAsianStartHour * 3600;
@@ -583,7 +614,13 @@ void OnTick()
 
    if(!NewBar()) return;
 
-   int regime = GetRegime();
+   int regime = 0;
+   if(!GetRegime(regime))
+   {
+      Comment("Waiting for valid regime indicator data...");
+      Print("Entry evaluation skipped: regime indicator data unavailable.");
+      return;
+   }
    string rName = (regime > 0 ? "BULL" : (regime < 0 ? "BEAR" : "NEUTRAL"));
    Comment("Regime: ", rName,
            " | Trades T/R/B: ", tradesToday[1], "/", tradesToday[2], "/", tradesToday[3],
